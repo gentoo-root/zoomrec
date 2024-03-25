@@ -1,0 +1,377 @@
+#cloud-config
+# Run /root/provision.sh after cloud-init is finished, and the domain name
+# points to this server's IP.
+hostname: zoomrec
+timezone: Europe/Kyiv
+swap:
+  filename: /swap
+  size: 2G
+users:
+  - name: root
+    ssh_import_id:
+      - gh:@@GITHUB_USERNAME@@
+  - name: zoom
+    plain_text_passwd: @@PASSWORD_USER@@
+    lock_passwd: false
+    ssh_import_id:
+      - gh:@@GITHUB_USERNAME@@
+write_files:
+  - path: /root/provision.sh
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set -e
+      echo "\e[1;31mFirst make sure that @@DOMAIN@@ points to this server's IP address!\e[0m"
+      sleep 5
+      docker run -it --rm --name certbot -v /opt/guacamole/certbot/etc:/etc/letsencrypt -v /opt/guacamole/certbot/www:/var/www/certbot -p 80:80 certbot/certbot certonly --domains @@DOMAIN@@ --agree-tos --no-eff-email --standalone
+      systemctl enable --now guacamole.service certbot-renew.timer
+      echo
+      echo '\e[1;31mDefault guacamole credentials are guacadmin:guacadmin. Change them immediately!\e[0m'
+      echo 'Then create an RDP connection to 172.17.0.1:3389, leave the rest defaults.'
+      echo "It's recommended to create an unprivileged user that will only be able to connect to RDP."
+  - path: /etc/tmpfiles.d/zswap.conf
+    content: |
+      w /sys/module/zswap/parameters/enabled - - - - Y
+  - path: /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-screensaver.xml
+    content: |
+      <?xml version="1.0" encoding="UTF-8"?>
+
+      <channel name="xfce4-screensaver" version="1.0">
+        <property name="saver" type="empty">
+          <property name="enabled" type="bool" value="false"/>
+          <property name="idle-activation" type="empty">
+            <property name="enabled" type="bool" value="false"/>
+          </property>
+        </property>
+        <property name="lock" type="empty">
+          <property name="enabled" type="bool" value="false"/>
+        </property>
+      </channel>
+  - path: /etc/apt/preferences.d/mozilla
+    content: |
+      Package: *
+      Pin: release o=LP-PPA-mozillateam
+      Pin-Priority: 1001
+  - path: /etc/apt/apt.conf.d/51unattended-upgrades-mozilla
+    content: |
+      Unattended-Upgrade::Allowed-Origins:: "LP-PPA-mozillateam:${distro_codename}";
+  - path: /etc/systemd/system/certbot-renew.timer
+    content: |
+      root@zoomrec:~# cat /etc/systemd/system/certbot-renew.timer
+      [Unit]
+      Description=Daily renewal of Let's Encrypt certificates
+
+      [Timer]
+      OnCalendar=08:00:00
+      RandomizedDelaySec=8h
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+  - path: /etc/systemd/system/certbot-renew.service
+    content: |
+      [Unit]
+      Description=Renew Let's Encrypt certificates
+      After=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/guacamole/cert-renew.sh
+  - path: /etc/systemd/system/guacamole.service
+    content: |
+      [Unit]
+      Description=Guacamole RDP proxy
+
+      [Service]
+      Type=simple
+      WorkingDirectory=/opt/guacamole
+      ExecStart=/usr/bin/docker-compose up
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/xrdp.service.d/50-after-docker.conf
+    content: |
+      # xrdp listens on the docker0 interface.
+      [Unit]
+      Wants=docker.service
+      After=docker.service
+  - path: /opt/guacamole/cert-renew.sh
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set -e
+      docker run --rm --name certbot -v /opt/guacamole/certbot/etc:/etc/letsencrypt -v /opt/guacamole/certbot/www:/var/www/certbot certbot/certbot renew --webroot
+      docker exec guacamole_nginx /usr/sbin/nginx -s reload
+  - path: /opt/guacamole/nginx/guacamole.conf
+    content: |
+      server {
+        listen 80;
+        listen [::]:80;
+        server_name @@DOMAIN@@;
+
+        location / {
+          return 308 https://$server_name$request_uri;
+        }
+
+        location /.well-known/acme-challenge/ {
+          root /var/www/certbot;
+        }
+      }
+
+      server {
+        listen 443 ssl;
+        listen [::]:443 ssl;
+        server_name @@DOMAIN@@;
+
+        ssl_certificate /etc/letsencrypt/live/@@DOMAIN@@/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/@@DOMAIN@@/privkey.pem;
+        ssl_trusted_certificate /etc/letsencrypt/live/@@DOMAIN@@/chain.pem;
+
+        # Secure protocols and ciphers.
+        ssl_protocols TLSv1.3;
+        ssl_ciphers 'TLS13_CHACHA20_POLY1305_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_AES_128_GCM_SHA256:ECDHE:!COMPLEMENTOFDEFAULT';
+        ssl_prefer_server_ciphers on;
+
+        # Resumable sessions to boost the performance.
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 4h;
+        ssl_session_tickets off;
+
+        location / {
+          proxy_pass http://guacamole:8080/guacamole/;
+          proxy_buffering off;
+          proxy_http_version 1.1;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $http_connection;
+          proxy_cookie_path /guacamole/ /;
+          access_log off;
+        }
+      }
+  - path: /opt/guacamole/docker-compose.yml
+    content: |
+      version: '3'
+
+      networks:
+        guacamole:
+          driver: bridge
+
+      services:
+        guacd:
+          container_name: guacamole_guacd
+          image: guacamole/guacd
+          networks:
+            guacamole:
+          # Don't restart here, because it will detach from guacamole.service, for
+          # example, when docker.service is restarted.
+          #restart: always
+        postgres:
+          container_name: guacamole_postgres
+          environment:
+            PGDATA: /var/lib/postgresql/data/guacamole
+            POSTGRES_DB: guacamole
+            POSTGRES_PASSWORD: '@@PASSWORD_DATABASE@@'
+            POSTGRES_USER: guacamole
+          image: postgres:16.2-alpine
+          networks:
+            guacamole:
+          #restart: always
+          volumes:
+            - ./initdb:/docker-entrypoint-initdb.d:z
+            - ./data:/var/lib/postgresql/data:Z
+        guacamole:
+          container_name: guacamole_client
+          depends_on:
+            - guacd
+            - postgres
+          environment:
+            GUACD_HOSTNAME: guacd
+            POSTGRES_DATABASE: guacamole
+            POSTGRES_HOSTNAME: postgres
+            POSTGRES_PASSWORD: '@@PASSWORD_DATABASE@@'
+            POSTGRES_USER: guacamole
+          image: guacamole/guacamole
+          links:
+            - guacd
+          networks:
+            guacamole:
+          #restart: always
+        nginx:
+          container_name: guacamole_nginx
+          image: nginx:mainline-alpine
+          links:
+            - guacamole
+          networks:
+            guacamole:
+          ports:
+            - 80:80
+            - 443:443
+          volumes:
+            - ./nginx:/etc/nginx/conf.d:ro
+            - ./certbot/etc:/etc/letsencrypt
+            - ./certbot/www:/var/www/certbot
+          #restart: always
+          command: /usr/sbin/nginx -g 'daemon off;'
+  - path: /root/xrdp.patch
+    content: |
+      --- a/etc/xrdp/xrdp.ini
+      +++ b/etc/xrdp/xrdp.ini
+      @@ -20,7 +20,7 @@
+       ;   port=tcp6://:3389                           *:3389
+       ;   port=tcp6://{<any ipv6 format addr>}:3389   {FC00:0:0:0:0:0:0:1}:3389
+       ;   port=vsock://<cid>:<port>
+      -port=3389
+      +port=tcp://172.17.0.1:3389
+       
+       ; 'port' above should be connected to with vsock instead of tcp
+       ; use this only with number alone in port above
+      @@ -208,19 +208,19 @@
+       [Xorg]
+       name=Xorg
+       lib=libxup.so
+      -username=ask
+      -password=ask
+      +username=zoom
+      +password=@@PASSWORD_USER@@
+       ip=127.0.0.1
+       port=-1
+       code=20
+       
+      -[Xvnc]
+      -name=Xvnc
+      -lib=libvnc.so
+      -username=ask
+      -password=ask
+      -ip=127.0.0.1
+      -port=-1
+      +##[Xvnc]
+      +##name=Xvnc
+      +##lib=libvnc.so
+      +##username=ask
+      +##password=ask
+      +##ip=127.0.0.1
+      +##port=-1
+       #xserverbpp=24
+       #delay_ms=2000
+       ; Disable requested encodings to support buggy VNC servers
+      @@ -234,13 +234,13 @@
+       ; Generic VNC Proxy
+       ; Tailor this to specific hosts and VNC instances by specifying an ip
+       ; and port and setting a suitable name.
+      -[vnc-any]
+      -name=vnc-any
+      -lib=libvnc.so
+      -ip=ask
+      -port=ask5900
+      -username=na
+      -password=ask
+      +##[vnc-any]
+      +##name=vnc-any
+      +##lib=libvnc.so
+      +##ip=ask
+      +##port=ask5900
+      +##username=na
+      +##password=ask
+       #pamusername=asksame
+       #pampassword=asksame
+       #pamsessionmng=127.0.0.1
+      @@ -249,15 +249,15 @@
+       ; Generic RDP proxy using NeutrinoRDP
+       ; Tailor this to specific hosts by specifying an ip and port and setting
+       ; a suitable name.
+      -[neutrinordp-any]
+      -name=neutrinordp-any
+      +##[neutrinordp-any]
+      +##name=neutrinordp-any
+       ; To use this section, you should build xrdp with configure option
+       ; --enable-neutrinordp.
+      -lib=libxrdpneutrinordp.so
+      -ip=ask
+      -port=ask3389
+      -username=ask
+      -password=ask
+      +##lib=libxrdpneutrinordp.so
+      +##ip=ask
+      +##port=ask3389
+      +##username=ask
+      +##password=ask
+       ; Uncomment the following lines to enable PAM authentication for proxy
+       ; connections.
+       #pamusername=ask
+package_update: true
+package_upgrade: true
+package_reboot_if_required: true
+apt:
+  sources:
+    mozilla:
+      source: 'ppa:mozillateam/ppa'
+    midori:
+      source: 'deb http://repo.astian.org midori main'
+      # wget 'http://repo.astian.org/midori-archive-keyring.gpg'
+      # gpg --no-default-keyring --keyring=midori-archive-keyring.gpg --export --armor
+      key: |
+        -----BEGIN PGP PUBLIC KEY BLOCK-----
+
+        mQGNBGVI7W4BDAC65cstUAH3pLnisTOEfODjqbHijl+o2a+jI2vnorB1gcFHxWI0
+        J8HgAnDrdaaKPwG856C/sl+bKfdzmi7twuNLzQQBp1yBL704A9/eHnJLoTaPJrid
+        jyGQ2aaIk8XcdLEzgMkbBF2jAf2j8oNDlpG+019S2rGqVdLKR5or8OIOmMKC4yTO
+        FIYQ/lvdKJgODNFFnk0+jsIWjTQYw7bQRefq687fbCa2IPIB7/JAMU28J1lPCWfW
+        404NckObFauZbf1y+BZ+zn5afb7u3GTb91SqzsEFpW5hpYeeE206i6QKKut3d2qC
+        R79tFI5T006JDouLQd/VbaUyYLYYAE0t3+pHrLF2jDHuChewQxo3Pbn2OEwuLqFf
+        MZEfPLBwOngOFcZSgMhuMNfNM6wFCydQiTdO0a9afDW6SWrpNKkdIXcU6qhpn6xy
+        tlryeTlsqiZicNRp47FXdtZ/LKTOCODNQdg9lxdCi8UW8C/q//IVWocwvC+UKH/9
+        o68sy7sp4nKfo5sAEQEAAbRHTmljb2xhcyBMb25nYXJkaSAoRmlybWEgZGUgcGFx
+        dWV0ZXMgZGUgTWlkb3JpKSA8bmljb0Bsb2Nvc3BvcmxpbnV4LmNvbT6JAc4EEwEK
+        ADgWIQT6LbTcDxPbMfwiGIX4cZ5rPG4i4QUCZUjtbgIbAwULCQgHAgYVCgkICwIE
+        FgIDAQIeAQIXgAAKCRD4cZ5rPG4i4REiC/sFzYBjHOX7roqGsNxJCCxggxTsW7dF
+        RIzhnKdDN8VVejho0BzB80TJWiZBmUPPax0XTVaWVxA/xWghpfAqdc6vtEnQDRb9
+        v1OX5PuLzxqgyeSqq0/cXXr6rT8Ypy9VNoOX/2jDI+4kmI69ylASTy44V1vZu1ZQ
+        9xvxteDe1fEzgu2tpqwvQ7evQh9hnWmSIwNppnWkGRvp0Vi1VTC30oT6EIMEHgY2
+        jk6KVyHaYAJS7F7VqhotEoYK/erwnU5IzrisnLRCzVfEvlgNqc6qnQFAgtMBDo/s
+        1KbvVWDMw8tb0+8XO7xtReFPvT0n2Kj7LrRhS/ztDfayXGmXf63Kjauav1cvjkwE
+        5j5MtmmZFvkHD8BhUUqlaGgBS7nDkoehopicaAsC9KWKqD9NbVIlE2B9IjyK/dAF
+        /EsacyzoIMsHfAE524JGWOjX5p6FQ4rFLegzrGWJa40hHFTTKKqX8DdYDkoiNcod
+        K2NEBwOF+Eu9pQ8kuWcXf0G3xEZ6UrGLWSo=
+        =mqJR
+        -----END PGP PUBLIC KEY BLOCK-----
+packages:
+  - docker.io
+  - docker-compose
+  - xrdp
+  - xorgxrdp
+  - xfce4-session
+  - xfce4-panel
+  - xfce4-pulseaudio-plugin
+  - xfce4-notifyd
+  - xfce4-appfinder
+  - xdg-user-dirs-gtk
+  - xdg-utils
+  - pulseaudio
+  - thunar
+  - mousepad
+  - firefox
+  - midori
+runcmd:
+  - 'chmod 600 /etc/xrdp/xrdp.ini'
+  - 'patch -Np1 -i /root/xrdp.patch'
+  - 'chmod 400 /etc/xrdp/xrdp.ini'
+  - 'chown xrdp /etc/xrdp/xrdp.ini'
+  - 'curl -L ''https://zoom.us/linux/download/pubkey?version=5-12-6'' -o /root/zoom.pub'
+  - 'curl -L ''https://zoom.us/client/latest/zoom_amd64.deb'' -o /root/zoom.deb'
+  - 'gpg --import /root/zoom.pub'
+  - 'gpg --verify /root/zoom.deb && apt install -y /root/zoom.deb'
+  - 'while [ "$(snap list | wc -l)" -gt 1 ]; do snap list | tail -n +2 | awk ''{print $1}'' | xargs -r -n 1 snap remove --purge; done'
+  - 'apt purge -y snapd bolt fwupd-signed ibus-gtk ibus-gtk3 ibus-gtk4 im-config libarchive13 libatasmart4 libblockdev-crypto2 libblockdev-fs2 libblockdev-loop2 libblockdev-part-err2 libblockdev-part2 libblockdev-swap2 libblockdev-utils2 libblockdev2 libflashrom1 libftdi1-2 libfwupd2 libfwupdplugin5 libgcab-1.0-0 libgpgme11 libgusb2 libjcat1 libmbim-glib4 libmbim-proxy libmm-glib0 libparted-fs-resize0 libsmbios-c2 libtcl8.6 libudisks2-0 libvolume-key1 multipath-tools tcl tcl8.6 tpm-udev upower usb-modeswitch usb-modeswitch-data'
+  - 'apt autoremove --purge -y'
+  - 'apt clean'
+  - 'mkdir -p /opt/guacamole/certbot /opt/guacamole/data /opt/guacamole/initdb'
+  - 'docker run --rm guacamole/guacamole /opt/guacamole/bin/initdb.sh --postgresql > /opt/guacamole/initdb/initdb.sql'
+  - 'runuser -u zoom -- env -u XDG_RUNTIME_DIR -- dbus-launch gsettings set org.gnome.desktop.screensaver idle-activation-enabled false'
+  - 'runuser -u zoom -- env -u XDG_RUNTIME_DIR -- dbus-launch gsettings set org.gnome.desktop.screensaver lock-enabled false'
+  - 'runuser -u zoom -- env -u XDG_RUNTIME_DIR -- dbus-launch gsettings set org.gnome.desktop.lockdown disable-lock-screen true'
+  # Fails from under cloud-init. Superseded by /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-screensaver.xml.
+  #- 'runuser -u zoom -- env -u XDG_RUNTIME_DIR -- dbus-launch --exit-with-session xfconf-query -c xfce4-screensaver -n -t bool -p /saver/enabled -s false'
+  #- 'runuser -u zoom -- env -u XDG_RUNTIME_DIR -- dbus-launch --exit-with-session xfconf-query -c xfce4-screensaver -n -t bool -p /saver/idle-activation/enabled -s false'
+  #- 'runuser -u zoom -- env -u XDG_RUNTIME_DIR -- dbus-launch --exit-with-session xfconf-query -c xfce4-screensaver -n -t bool -p /lock/enabled -s false'
+  - 'reboot'
